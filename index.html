@@ -1,0 +1,196 @@
+<!doctype html><html lang="tr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>VR Box AR</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#fff;touch-action:none}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:none}#c2{z-index:3;pointer-events:none}
+.yw{position:fixed;top:0;overflow:hidden;z-index:2;display:none;pointer-events:none}.yw iframe{position:absolute;border:0;border-radius:14px}
+#ov{position:fixed;inset:0;z-index:9;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:linear-gradient(135deg,#0b0f1a,#1b2340);text-align:center;padding:16px;overflow:auto}
+button,input{font-size:17px;padding:12px 22px;border:0;border-radius:26px}
+button{background:#4f8cff;color:#fff}input[type=text]{width:78%;background:#ffffff22;color:#fff}
+#st{font-size:14px;opacity:.8;max-width:80%}label{font-size:14px;opacity:.85}
+</style></head><body>
+<div id="ov"><h2 style="margin:0">VR Box AR</h2>
+<div style="font-size:14px">Telefonu yatay tut, VR kutusuna tak. İşaret + başparmak birleştir = tıkla / tut / sürükle.<br>Elini ileri-geri götürerek pencereyi uzaklaştır/yakınlaştır. İki elle tutup aç/kapa = büyüt/küçült.</div>
+<label>Fotoğraf / video ekle (isteğe bağlı)</label><input id="fi" type="file" accept="image/*,video/*" multiple>
+<label>YouTube linki veya video ID (isteğe bağlı)</label><input id="yi" type="text" placeholder="https://youtu.be/...">
+<label>Gemini API anahtarı (aistudio.google.com/apikey)</label><input id="ak" type="password" placeholder="AIza..."><input id="am" type="text" value="gemini-flash-latest">
+<button id="go">Başlat</button><div id="st"></div></div>
+<canvas id="c"></canvas><canvas id="c2"></canvas><video id="v" playsinline muted autoplay style="display:none"></video>
+<script type="module">
+const $=id=>document.getElementById(id),cv=$('c'),c2=$('c2'),v=$('v'),st=$('st');
+const ctx=cv.getContext('2d',{alpha:false,desynchronized:true}),x2=c2.getContext('2d');
+let S={ipd:0,fov:70,size:1,stereo:true};
+try{Object.assign(S,JSON.parse(localStorage.getItem('vrs')||'{}'))}catch(e){}
+const save=()=>{try{localStorage.setItem('vrs',JSON.stringify(S))}catch(e){}};
+const clamp=(a,l,h)=>Math.min(h,Math.max(l,a)),D=Math.PI/180;
+// ---- Jiroskop ----
+let q=[0,0,0,1],have=false;
+const qm=(a,b)=>[a[3]*b[0]+a[0]*b[3]+a[1]*b[2]-a[2]*b[1],a[3]*b[1]-a[0]*b[2]+a[1]*b[3]+a[2]*b[0],a[3]*b[2]+a[0]*b[1]-a[1]*b[0]+a[2]*b[3],a[3]*b[3]-a[0]*b[0]-a[1]*b[1]-a[2]*b[2]];
+function onOri(e){if(e.alpha==null)return;have=true;
+ const x=(e.beta||0)*D,y=e.alpha*D,z=-(e.gamma||0)*D,c1=Math.cos(x/2),c2_=Math.cos(y/2),c3=Math.cos(z/2),s1=Math.sin(x/2),s2=Math.sin(y/2),s3=Math.sin(z/2);
+ let r=[s1*c2_*c3+c1*s2*s3,c1*s2*c3-s1*c2_*s3,c1*c2_*s3-s1*s2*c3,c1*c2_*c3+s1*s2*s3];
+ r=qm(r,[-Math.SQRT1_2,0,0,Math.SQRT1_2]);
+ const o=-((screen.orientation&&screen.orientation.angle)||window.orientation||0)*D;
+ q=qm(r,[0,0,Math.sin(o/2),Math.cos(o/2)])}
+const cj=()=>[-q[0],-q[1],-q[2],q[3]];
+const toCam=d=>qm(qm(cj(),[d[0],d[1],d[2],0]),q);
+const fwdYaw=()=>{const a=qm(qm(q,[0,0,-1,0]),cj());return Math.atan2(a[0],-a[2])};
+// ---- Veri ----
+const T={note:'',yt:'',ai:'',web:''};const AI={key:'',model:'gemini-flash-latest',log:[],hist:[],busy:false};try{T.note=localStorage.getItem('note')||''}catch(e){}
+let foc='note',sh=false,ytId='',ytPlay=true,photos=[],vids=[],pi=0,vi=0;
+const ytParse=s=>{const m=(s||'').match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([\w-]{11})/)||(s||'').trim().match(/^([\w-]{11})$/);return m?m[1]:''};
+// ---- El takibi (2 el) ----
+const hands=[0,1].map(()=>({on:false,pinch:false,down:false,x:0,y:0,sz:.1,lm:null,grab:null}));
+let hl=null,lastT=-1;
+async function initHands(){try{
+ const m=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+ const f=await m.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+ hl=await m.HandLandmarker.createFromOptions(f,{baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'GPU'},runningMode:'VIDEO',numHands:2,minHandDetectionConfidence:.5,minTrackingConfidence:.5})}catch(e){hl=null;console.error(e)}}
+let lastD=0;function track(){if(!hl||v.readyState<2||v.currentTime===lastT)return;const nw=performance.now();if(nw-lastD<28)return;lastD=nw;lastT=v.currentTime;let r;try{r=hl.detectForVideo(v,performance.now())}catch(e){return}
+ const L=r.landmarks||[];
+ hands.forEach((h,i)=>{const m=L[i];h.down=h.down&&false;if(!m){h.on=false;h.pinch=false;h.lm=null;return}
+  h.lm=m;const a=m[8],b=m[4],sz=Math.hypot(m[0].x-m[9].x,m[0].y-m[9].y)||.1,pd=Math.hypot(a.x-b.x,a.y-b.y)/sz;
+  const nx=(a.x+b.x)/2,ny=(a.y+b.y)/2,al=h.on?clamp(.3+Math.hypot(nx-h.x,ny-h.y)*14,.3,.95):1;
+  h.x=h.on?h.x+(nx-h.x)*al:nx;h.y=h.on?h.y+(ny-h.y)*al:ny;h.sz=h.on?h.sz*.7+sz*.3:sz;h.on=true;
+  const p=h.pinch?pd<.5:pd<.32;h.down=p&&!h.pinch;h.pinch=p})}
+// ---- Pencereler ----
+const vib=()=>navigator.vibrate&&navigator.vibrate(12);
+const APPS={
+ yt:{ic:'▶️',t:'YouTube',lw:480,lh:348,draw:dYT},store:{ic:'🛍️',t:'Play Store',lw:480,lh:260,draw:dStore},
+ vid:{ic:'🎬',t:'Video',lw:480,lh:310,draw:dVid},img:{ic:'🖼️',t:'Fotoğraf',lw:480,lh:310,draw:dImg},
+ note:{ic:'📝',t:'Not',lw:480,lh:300,draw:dNote},kb:{ic:'⌨️',t:'Klavye',lw:480,lh:262,draw:dKb},
+ set:{ic:'⚙️',t:'Ayarlar',lw:480,lh:262,draw:dSet},ai:{ic:'✨',t:'Gemini',lw:480,lh:350,draw:dAI},web:{ic:'🌐',t:'Chrome',lw:480,lh:230,draw:dWeb},dock:{ic:'',t:'',lw:700,lh:96}};
+const DOCK=['ai','web','yt','store','vid','img','note','kb','set'];
+let wins=[];
+const mk=(app,yaw,pitch,dist,w)=>({app,yaw,pitch,dist,w,lw:APPS[app].lw,lh:APPS[app].lh,btns:[],hv:-1,bi:0});
+function openApp(k){let w=wins.find(x=>x.app===k);const y=fwdYaw();
+ if(!w){w=mk(k,y,0,1.4,.9);wins.push(w)}else{w.yaw=y;w.pitch=0;w.dist=1.4}
+ if(k==='note'||k==='yt'||k==='ai'||k==='web'){foc=k;if(!wins.find(x=>x.app==='kb')){const kb=mk('kb',y,-.5,1.3,.8);wins.push(kb)}}}
+const closeWin=w=>{wins=wins.filter(x=>x!==w)};
+const closeAll=()=>{wins=wins.filter(x=>x.app==='dock')};
+function recenter(){const dk=wins.find(x=>x.app==='dock'),d=fwdYaw()-dk.yaw;wins.forEach(w=>w.yaw+=d)}
+// ---- Çizim yardımcıları ----
+let W,H;function resize(){const r=devicePixelRatio||1;cv.width=c2.width=W=Math.round(innerWidth*r);cv.height=c2.height=H=Math.round(innerHeight*r)}
+addEventListener('resize',resize);
+const rr=(c,x,y,w,h,r)=>{c.beginPath();c.roundRect?c.roundRect(x,y,w,h,r):c.rect(x,y,w,h)};
+const vidRect=(ew,eh)=>{const vw=v.videoWidth||16,vh=v.videoHeight||9,k=Math.max(ew/vw,eh/vh);return{w:vw*k,h:vh*k}};
+const shift=i=>(i?-1:1)*S.ipd*(W/1000)*.5*(S.stereo?1:0);
+function glass(x,y,w,h,r){ctx.save();ctx.shadowColor='rgba(0,0,0,.4)';ctx.shadowBlur=24;ctx.fillStyle='rgba(30,36,58,.55)';rr(ctx,x,y,w,h,r);ctx.fill();ctx.restore();
+ const g=ctx.createLinearGradient(0,y,0,y+h);g.addColorStop(0,'rgba(255,255,255,.28)');g.addColorStop(1,'rgba(255,255,255,.08)');ctx.fillStyle=g;rr(ctx,x,y,w,h,r);ctx.fill();
+ ctx.strokeStyle='rgba(255,255,255,.4)';ctx.lineWidth=1.5;rr(ctx,x,y,w,h,r);ctx.stroke()}
+function txt(s,x,y,o={}){ctx.fillStyle=o.c||'#fff';ctx.font=`${o.w||''} ${o.fs||16}px system-ui`;ctx.textAlign=o.a||'left';ctx.textBaseline='middle';ctx.fillText(s,x,y)}
+function btn(w,i,l,x,y,bw,bh,fn,o={}){const n=w.bi++,hv=w.hv===n;if(i===0)w.cur.push([x,y,bw,bh,fn]);
+ ctx.save();if(o.ic&&hv){ctx.translate(x+bw/2,y+bh/2);ctx.scale(1.2,1.2);ctx.translate(-bw/2,-bh/2)}else ctx.translate(x,y);
+ ctx.fillStyle=hv?'rgba(255,255,255,.5)':(o.c||'rgba(255,255,255,.2)');rr(ctx,0,0,bw,bh,o.ic?bw/2:bh*.32);ctx.fill();
+ txt(l,bw/2,bh/2+1,{a:'center',fs:o.fs||Math.min(bh*.5,18)});ctx.restore()}
+function proj(w,f){const p=w.pitch,d=[Math.sin(w.yaw)*Math.cos(p),Math.sin(p),-Math.cos(w.yaw)*Math.cos(p)],c=toCam(d);if(c[2]>-.05)return null;
+ const s=f/-c[2],pw=w.w*S.size*s/w.dist;return{x:c[0]*s,y:-c[1]*s,w:pw,h:pw*w.lh/w.lw,k:pw/w.lw}}
+function drawWin(w,p,i){ctx.save();ctx.translate(p.x-p.w/2,p.y-p.h/2);ctx.scale(p.k,p.k);w.bi=0;if(i===0)w.cur=[];
+ if(w.app==='dock'){glass(0,0,w.lw,w.lh,48);DOCK.forEach((k,n)=>btn(w,i,APPS[k].ic,14+n*78,16,64,64,()=>openApp(k),{ic:1,fs:30}))}
+ else{const A=APPS[w.app];glass(0,0,w.lw,w.lh,24);txt(A.ic+'  '+A.t,18,18,{w:'600',fs:15});
+  btn(w,i,'✕',w.lw-38,4,28,28,()=>closeWin(w),{c:'rgba(255,95,87,.75)',fs:14});
+  ctx.fillStyle='rgba(255,255,255,.55)';rr(ctx,w.lw/2-40,w.lh+8,80,6,3);ctx.fill();A.draw(w,i)}
+ ctx.restore();if(i===0)w.btns=w.cur}
+function eye(ox,ew,eh,L,i){ctx.save();ctx.beginPath();ctx.rect(ox,0,ew,eh);ctx.clip();ctx.translate(ox+ew/2+shift(i),eh/2);
+ const vr=vidRect(ew,eh);ctx.drawImage(v,-vr.w/2,-vr.h/2,vr.w,vr.h);for(const o of L)drawWin(o.w,o.p,i);ctx.restore()}
+const FING=[[0,1,2,3,4],[0,5,6,7,8],[0,9,10,11,12],[0,13,14,15,16],[0,17,18,19,20]];
+function handsEye(ox,ew,eh,i){x2.save();x2.beginPath();x2.rect(ox,0,ew,eh);x2.clip();x2.translate(ox+ew/2+shift(i),eh/2);const vr=vidRect(ew,eh);
+ for(const h of hands){if(!h.on||!h.lm)continue;x2.strokeStyle='rgba(255,255,255,.5)';x2.lineWidth=2;
+  for(const ch of FING){x2.beginPath();ch.forEach((j,n)=>{const x=(h.lm[j].x-.5)*vr.w,y=(h.lm[j].y-.5)*vr.h;n?x2.lineTo(x,y):x2.moveTo(x,y)});x2.stroke()}
+  x2.fillStyle=h.pinch?'#ff4f6a':'rgba(125,255,176,.9)';x2.beginPath();x2.arc(h.cx||0,h.cy||0,eh*(h.pinch?.014:.022),0,7);x2.fill();x2.strokeStyle='#fff';x2.lineWidth=3;x2.stroke()}
+ x2.restore()}
+// ---- Etkileşim ----
+function interact(L,ew,f){const vr=vidRect(ew,H);wins.forEach(w=>w.hv=-1);
+ for(const h of hands){if(!h.on){h.grab=null;continue}
+  h.cx=(h.x-.5)*vr.w;h.cy=(h.y-.5)*vr.h;h.hit=null;
+  for(let n=L.length-1;n>=0;n--){const{w,p}=L[n],u=(h.cx-(p.x-p.w/2))/p.k,vv=(h.cy-(p.y-p.h/2))/p.k;
+   if(u>=0&&u<=w.lw&&vv>=0&&vv<=w.lh){h.hit={w,b:w.btns.findIndex(b=>u>=b[0]&&u<=b[0]+b[2]&&vv>=b[1]&&vv<=b[1]+b[3])};break}}
+  if(h.hit&&h.hit.b>=0)h.hit.w.hv=h.hit.b;
+  if(h.down){h.down=false;const t=h.hit;
+   if(t){if(t.w.app in T)foc=t.w.app;
+    if(t.b>=0){const fn=t.w.btns[t.b][4];vib();fn();break_()}
+    else if(t.w.app!=='dock')h.grab={w:t.w,cx:h.cx,cy:h.cy,yaw:t.w.yaw,pitch:t.w.pitch,dist:t.w.dist,sz:h.sz}}}
+  if(!h.pinch)h.grab=null}
+ const g=hands.filter(h=>h.on&&h.grab);
+ if(g.length===2&&g[0].grab.w===g[1].grab.w){const w=g[0].grab.w,d=Math.hypot(g[0].cx-g[1].cx,g[0].cy-g[1].cy);if(!w.d0){w.d0=d;w.w0=w.w}w.w=clamp(w.w0*d/w.d0,.4,3)}
+ else{wins.forEach(w=>w.d0=0);for(const h of g){const a=h.grab,w=a.w;w.yaw=a.yaw+(h.cx-a.cx)/f;w.pitch=clamp(a.pitch-(h.cy-a.cy)/f,-1.2,1.2);w.dist=clamp(a.dist*a.sz/h.sz,.5,4)}}}
+function break_(){}
+// ---- Uygulamalar ----
+function dYT(w,i){txt(ytId?'':'Klavye ile YouTube linki / 11 karakterli ID yaz, sonra ⏎ Aç',w.lw/2,170,{a:'center',fs:14,c:'#ffffffaa'});
+ btn(w,i,ytPlay?'⏸':'▶',12,312,44,30,()=>{ytPlay=!ytPlay;ytCmd(ytPlay?'playVideo':'pauseVideo')});
+ txt('🔗 '+(T.yt||'ID / link'),66,327,{fs:13,c:foc==='yt'?'#9fd0ff':'#fff'});
+ btn(w,i,'⏎ Aç',w.lw-92,312,80,30,()=>{const id=ytParse(T.yt);if(id){ytId=id;ytPlay=true}})}
+function dStore(w,i){txt('Oyunlar Play Store uygulamasında açılır (Cardboard/VR uyumlu oyunlar).',w.lw/2,52,{a:'center',fs:13,c:'#ffffffbb'});
+ [['🎮 VR Oyunları','vr games'],['🥽 Cardboard','google cardboard'],['🌐 360° Video','360 vr video'],['🕹️ Mağazayı Aç','']].forEach((a,n)=>
+  btn(w,i,a[0],20+(n%2)*230,76+Math.floor(n/2)*84,210,66,()=>{location.href='https://play.google.com/store/'+(a[1]?'search?c=apps&q='+encodeURIComponent(a[1]):'apps')},{fs:18}))}
+function fit(m,mw,mh,x,y,w,h){const k=Math.min(w/mw,h/mh);ctx.drawImage(m,x+(w-mw*k)/2,y+(h-mh*k)/2,mw*k,mh*k)}
+function dVid(w,i){const m=vids[vi];if(!m){txt('Başlangıç ekranından video ekle',w.lw/2,150,{a:'center',fs:15,c:'#ffffffaa'})}
+ else{if(m.videoWidth)fit(m,m.videoWidth,m.videoHeight,10,38,460,220);
+  btn(w,i,'◀',150,266,50,34,()=>{m.pause();vi=(vi+vids.length-1)%vids.length;vids[vi].play().catch(()=>{})});
+  btn(w,i,m.paused?'▶':'⏸',215,266,50,34,()=>{m.paused?m.play().catch(()=>{}):m.pause()});
+  btn(w,i,'▶▶',280,266,50,34,()=>{m.pause();vi=(vi+1)%vids.length;vids[vi].play().catch(()=>{})});
+  txt((vi+1)+'/'+vids.length,w.lw-14,283,{a:'right',fs:12})}}
+function dImg(w,i){const m=photos[pi];if(!m){txt('Başlangıç ekranından fotoğraf ekle',w.lw/2,150,{a:'center',fs:15,c:'#ffffffaa'})}
+ else{fit(m,m.naturalWidth,m.naturalHeight,10,38,460,220);
+  btn(w,i,'◀',170,266,60,34,()=>pi=(pi+photos.length-1)%photos.length);btn(w,i,'▶',250,266,60,34,()=>pi=(pi+1)%photos.length);
+  txt((pi+1)+'/'+photos.length,w.lw-14,283,{a:'right',fs:12})}}
+function dNote(w,i){const lines=[];(T.note+(foc==='note'&&(performance.now()%1000<500)?'|':'')).split('\n').forEach(l=>{do{lines.push(l.slice(0,38));l=l.slice(38)}while(l.length)});
+ lines.slice(-9).forEach((l,n)=>txt(l,18,56+n*26,{fs:18}));btn(w,i,'Temizle',w.lw-98,4,56,28,()=>{T.note='';svN()},{fs:11})}
+const svN=()=>{try{localStorage.setItem('note',T.note)}catch(e){}};
+function key(c){if(c==='⌫')T[foc]=T[foc].slice(0,-1);else if(c==='⏎'){if(foc==='yt'){const id=ytParse(T.yt);if(id){ytId=id;ytPlay=true}}else if(foc==='ai')askAI(false);else if(foc==='web')webGo();else T.note+='\n'}
+ else if(c==='␣')T[foc]+=' ';else if(c==='⇧')sh=!sh;else{T[foc]+=sh?c.toLocaleUpperCase('tr'):c;sh=false}svN()}
+function dKb(w,i){const R=['1234567890','qwertyuıopğü','asdfghjklşi','zxcvbnmöç.-'];
+ R.forEach((r,n)=>[...r].forEach((c,j)=>btn(w,i,sh?c.toLocaleUpperCase('tr'):c,14+j*38+n*10,42+n*44,36,40,()=>key(c),{fs:17})));
+ btn(w,i,'⇧',14,222,60,36,()=>key('⇧'),{c:sh?'rgba(79,140,255,.8)':0});btn(w,i,'␣ boşluk',84,222,230,36,()=>key('␣'));
+ btn(w,i,'⌫',324,222,66,36,()=>key('⌫'));btn(w,i,'⏎',400,222,66,36,()=>key('⏎'))}
+async function askAI(img){const t=T.ai.trim();if(!t||AI.busy)return;
+ if(!AI.key){AI.log.push(['sys','API anahtarı yok. Başlangıç ekranına gir.']);return}
+ AI.log.push(['u',t]);T.ai='';AI.busy=true;const parts=[{text:t}];
+ if(img){const c=document.createElement('canvas');c.width=512;c.height=Math.round(512*(v.videoHeight||9)/(v.videoWidth||16));c.getContext('2d').drawImage(v,0,0,c.width,c.height);parts.push({inline_data:{mime_type:'image/jpeg',data:c.toDataURL('image/jpeg',.7).split(',')[1]}})}
+ try{const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+AI.model+':generateContent',{method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':AI.key},
+  body:JSON.stringify({system_instruction:{parts:[{text:'Türkçe, kısa ve net cevap ver (en fazla 4 cümle).'}]},contents:[...AI.hist,{role:'user',parts}]})});
+  const j=await r.json(),a=(j.candidates&&j.candidates[0]&&j.candidates[0].content&&j.candidates[0].content.parts.map(p=>p.text||'').join(''))||(j.error&&j.error.message)||'Cevap yok';
+  AI.hist.push({role:'user',parts:[{text:t}]},{role:'model',parts:[{text:a}]});AI.hist=AI.hist.slice(-12);AI.log.push(['a',a])}catch(e){AI.log.push(['sys','Hata: '+e.message])}AI.busy=false}
+function dAI(w,i){const ln=[];AI.log.slice(-6).forEach(m=>{let t=(m[0]==='u'?'Sen: ':m[0]==='a'?'AI: ':'! ')+m[1];t.split('\n').forEach(l=>{do{ln.push(l.slice(0,50));l=l.slice(50)}while(l.length)})});
+ if(AI.busy)ln.push('… düşünüyor');ln.slice(-10).forEach((l,n)=>txt(l,16,52+n*22,{fs:14}));
+ txt('💬 '+T.ai+(foc==='ai'&&performance.now()%1000<500?'|':''),16,284,{fs:15,c:foc==='ai'?'#9fd0ff':'#fff'});
+ btn(w,i,'Gönder',16,304,130,34,()=>askAI(false));btn(w,i,'📷 Kameraya sor',156,304,170,34,()=>askAI(true));btn(w,i,'Temizle',336,304,128,34,()=>{AI.log=[];AI.hist=[]})}
+const webGo=()=>{const q=T.web.trim();if(q)location.href=/^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(q)?'https://'+q:'https://www.google.com/search?q='+encodeURIComponent(q)};
+function dWeb(w,i){txt('Chrome/tarayıcı ayrı uygulama olarak açılır (siteler gömülmeyi engelliyor).',w.lw/2,52,{a:'center',fs:12,c:'#ffffffbb'});
+ txt('🔎 '+T.web+(foc==='web'&&performance.now()%1000<500?'|':''),16,92,{fs:16,c:foc==='web'?'#9fd0ff':'#fff'});
+ btn(w,i,'Ara / Git',16,116,140,40,webGo);btn(w,i,'Google',166,116,140,40,()=>location.href='https://www.google.com');btn(w,i,'YouTube',316,116,148,40,()=>location.href='https://m.youtube.com');
+ btn(w,i,'Haberler',16,170,140,40,()=>location.href='https://news.google.com');btn(w,i,'Harita',166,170,140,40,()=>location.href='https://maps.google.com');btn(w,i,'Çeviri',316,170,148,40,()=>location.href='https://translate.google.com')}
+function dSet(w,i){[['IPD',S.ipd,-4,4,-120,120],['Görüş açısı',S.fov,-5,5,40,110],['Pencere boyutu',S.size.toFixed(1),-.1,.1,.5,2]].forEach((r,n)=>{const y=46+n*48,k=['ipd','fov','size'][n];
+  txt(r[0]+': '+r[1],20,y+18);btn(w,i,'−',330,y,50,36,()=>{S[k]=clamp(S[k]+r[2],r[4],r[5]);save()});btn(w,i,'+',400,y,50,36,()=>{S[k]=clamp(S[k]+r[3],r[4],r[5]);save()})});
+ btn(w,i,S.stereo?'Çift ekran: Açık':'Çift ekran: Kapalı',20,204,200,40,()=>{S.stereo=!S.stereo;save()});
+ btn(w,i,'Ortala',230,204,90,40,recenter);btn(w,i,'Hepsini kapat',330,204,130,40,closeAll)}
+// ---- YouTube iframe'leri (her göze bir tane) ----
+const ytW=[0,1].map(()=>{const d=document.createElement('div');d.className='yw';const f=document.createElement('iframe');f.allow='autoplay;encrypted-media;fullscreen';f.referrerPolicy='strict-origin-when-cross-origin';d.appendChild(f);document.body.appendChild(d);return d});
+const ytCmd=fn=>ytW.forEach(d=>{try{d.firstChild.contentWindow.postMessage(JSON.stringify({event:'command',func:fn,args:[]}),'*')}catch(e){}});
+function updYT(L,ew){const o=L.find(o=>o.w.app==='yt'),r=innerWidth/W;
+ ytW.forEach((d,i)=>{if(!o||!ytId||(i&&!S.stereo)){d.style.display='none';return}
+  const f=d.firstChild;if(d.dataset.id!==ytId){d.dataset.id=ytId;f.src='https://www.youtube.com/embed/'+ytId+'?autoplay=1&playsinline=1&enablejsapi=1&controls=0&rel=0&loop=1&playlist='+ytId+'&mute='+i}
+  const{p}=o,ox=i*ew;d.style.display='block';d.style.left=ox*r+'px';d.style.width=ew*r+'px';d.style.height=H*r+'px';
+  f.style.left=(ew/2+shift(i)+p.x-p.w/2)*r+'px';f.style.top=(H/2+p.y-p.h/2+34*p.k)*r+'px';f.style.width=480*p.k*r+'px';f.style.height=270*p.k*r+'px'})}
+// ---- Döngü ----
+function frame(){requestAnimationFrame(frame);track();
+ const ew=S.stereo?W/2:W,f=(H/2)/Math.tan(S.fov*D/2);
+ const L=wins.map(w=>({w,p:proj(w,f)})).filter(o=>o.p).sort((a,b)=>b.w.dist-a.w.dist);
+ interact(L,ew,f);
+ ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);eye(0,ew,H,L,0);if(S.stereo)eye(ew,ew,H,L,1);
+ x2.clearRect(0,0,W,H);handsEye(0,ew,H,0);if(S.stereo)handsEye(ew,ew,H,1);
+ vids.forEach((m,n)=>{if(n!==vi&&!m.paused)m.pause()});updYT(L,ew)}
+// ---- Başlat ----
+$('go').onclick=async()=>{
+ try{if(window.DeviceOrientationEvent&&DeviceOrientationEvent.requestPermission){if(await DeviceOrientationEvent.requestPermission()!=='granted')throw 'Jiroskop izni reddedildi'}
+ for(const fl of $('fi').files){const u=URL.createObjectURL(fl);if(fl.type.startsWith('image')){const im=new Image();im.src=u;photos.push(im)}else if(fl.type.startsWith('video')){const m=document.createElement('video');m.src=u;m.loop=true;m.playsInline=true;m.preload='auto';m.load();vids.push(m)}}
+ T.yt=$('yi').value.trim();AI.key=$('ak').value.trim()||localStorage.getItem('gk')||'';AI.model=$('am').value.trim()||AI.model;try{if(AI.key)localStorage.setItem('gk',AI.key)}catch(e){}ytId=ytParse(T.yt);
+ const s=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720},frameRate:{ideal:60,min:30}}});
+ v.srcObject=s;await v.play();addEventListener('deviceorientation',onOri,true);
+ try{await document.documentElement.requestFullscreen();await screen.orientation.lock('landscape')}catch(e){}
+ try{await navigator.wakeLock.request('screen')}catch(e){}
+ $('ov').style.display='none';cv.style.display=c2.style.display='block';resize();
+ setTimeout(()=>{wins=[mk('dock',have?fwdYaw():0,-.5,1.2,.95)];if(ytId)openApp('yt')},600);initHands();frame();
+ }catch(e){st.textContent='Hata: '+(e.message||e)}};
+</script></body></html>
